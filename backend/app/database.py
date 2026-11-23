@@ -59,6 +59,8 @@ DDL_STATEMENTS = [
         window_start TEXT NOT NULL,
         window_end TEXT NOT NULL,
         dimension_key TEXT NOT NULL DEFAULT '',
+        dimension_values TEXT NOT NULL DEFAULT '{}',
+        missing_dimensions TEXT NOT NULL DEFAULT '[]',
         computed_value REAL NOT NULL DEFAULT 0.0,
         event_count INTEGER NOT NULL DEFAULT 0,
         computation_version INTEGER NOT NULL DEFAULT 1,
@@ -67,6 +69,36 @@ DDL_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_agg_results_window ON aggregation_results(window_id, window_start)",
     "CREATE INDEX IF NOT EXISTS idx_agg_results_dim ON aggregation_results(dimension_key)",
+    "CREATE INDEX IF NOT EXISTS idx_agg_results_version ON aggregation_results(window_id, computation_version, dimension_key)",
+
+    # 贡献事件关联：一条聚合结果由哪些原始事件贡献，下钻时按同一版本精确回放
+    """CREATE TABLE IF NOT EXISTS aggregation_result_events (
+        result_id INTEGER NOT NULL,
+        event_id INTEGER NOT NULL,
+        PRIMARY KEY (result_id, event_id),
+        FOREIGN KEY (result_id) REFERENCES aggregation_results(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agg_result_events_result ON aggregation_result_events(result_id)",
+
+    # 计算版本登记：按窗口 × 版本 × 维度分组记录完成状态，
+    # 支持部分分组先出新版、其余分组仍在重算的中间态。
+    """CREATE TABLE IF NOT EXISTS aggregation_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        window_id INTEGER NOT NULL,
+        computation_version INTEGER NOT NULL,
+        dimension_key TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT '已完成',
+        result_id INTEGER,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        window_start TEXT,
+        window_end TEXT,
+        as_of TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        UNIQUE(window_id, computation_version, dimension_key),
+        FOREIGN KEY (window_id) REFERENCES aggregation_windows(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agg_versions_lookup ON aggregation_versions(window_id, computation_version, dimension_key)",
 
     # ==================== Metric Tier ====================
     """CREATE TABLE IF NOT EXISTS metrics (
@@ -373,8 +405,22 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        self._migrate(conn)
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """为已有库补齐新增列（CREATE TABLE IF NOT EXISTS 不会改旧表）。"""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(aggregation_results)")}
+        if "dimension_values" not in columns:
+            conn.execute(
+                "ALTER TABLE aggregation_results ADD COLUMN dimension_values TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "missing_dimensions" not in columns:
+            conn.execute(
+                "ALTER TABLE aggregation_results ADD COLUMN missing_dimensions TEXT NOT NULL DEFAULT '[]'"
+            )
 
     @classmethod
     def get(cls) -> AnalyticsDB:

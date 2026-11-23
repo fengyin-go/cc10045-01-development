@@ -46,7 +46,14 @@
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
+        <tr
+          v-for="row in rows"
+          :key="String(row.id)"
+          :data-testid="`row-${row.id}`"
+          :data-status="String(row.status)"
+          :class="{ 'row-selectable': credentialModule, 'row-selected': isSelected(row) }"
+          @click="selectRow(row)"
+        >
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
@@ -56,7 +63,7 @@
               class="link"
               type="button"
               :data-testid="`action-${row.id}-${action}`"
-              @click="runAction(action, row)"
+              @click.stop="runAction(action, row)"
             >
               {{ action }}
             </button>
@@ -86,6 +93,24 @@
       </form>
     </div>
 
+    <label v-if="meta.key === 'drill_path' && dashboardOptions.length" class="credential-target">
+      <span>查看哪个仪表盘的图表凭据</span>
+      <select v-model.number="selectedDashboardId" data-testid="credential-dashboard">
+        <option v-for="option in dashboardOptions" :key="option.id" :value="option.id">
+          {{ option.name }}
+        </option>
+      </select>
+    </label>
+
+    <ChartCredentialPanel
+      v-if="credentialModule && selectedDashboardId"
+      :key="selectedDashboardId"
+      :dashboard-id="selectedDashboardId"
+    />
+    <p v-else-if="credentialModule" class="credential-hint">
+      选择一个{{ meta.entity }}后可展开汇总凭据，核对图表取数依据与明细条数。
+    </p>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -94,8 +119,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
+import ChartCredentialPanel from '@/components/ChartCredentialPanel.vue'
 import {
   createEntry,
   downloadEntries,
@@ -106,25 +132,72 @@ import {
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
-const meta = moduleMeta(props.moduleKey)
+const meta = computed(() => moduleMeta(props.moduleKey))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
-const filterFields = meta.fields.slice(0, 3)
+const filterFields = computed(() => meta.value.fields.slice(0, 3))
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
 const stats = computed(() => [
-  { label: meta.metrics[0], value: total.value },
-  { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
+  { label: meta.value.metrics[0], value: total.value },
   {
-    label: meta.metrics[2],
-    value: rows.value.filter((row) => row.status === meta.statuses[meta.statuses.length - 1]).length,
+    label: meta.value.metrics[1],
+    value: rows.value.filter((row) => row.status === meta.value.statuses[1]).length,
+  },
+  {
+    label: meta.value.metrics[2],
+    value: rows.value.filter((row) => row.status === meta.value.statuses[meta.value.statuses.length - 1]).length,
   },
 ])
+
+// 仪表盘构建器 / 下钻路径展示汇总凭据视图：选中一条记录即可展开取数依据。
+const credentialModule = computed(
+  () => meta.value.key === 'dashboard_builder' || meta.value.key === 'drill_path',
+)
+const selectedDashboardId = ref<number | null>(null)
+const dashboardOptions = ref<{ id: number; name: string }[]>([])
+
+function selectRow(row: EntryRow) {
+  if (meta.value.key !== 'dashboard_builder') return
+  selectedDashboardId.value = Number(row.id)
+}
+
+function isSelected(row: EntryRow): boolean {
+  return meta.value.key === 'dashboard_builder' && Number(row.id) === selectedDashboardId.value
+}
+
+watch(rows, (next) => {
+  if (meta.value.key !== 'dashboard_builder') return
+  if (!next.length) {
+    selectedDashboardId.value = null
+    return
+  }
+  if (!selectedDashboardId.value || !next.some((row) => Number(row.id) === selectedDashboardId.value)) {
+    selectedDashboardId.value = Number(next[0].id)
+  }
+})
+
+async function loadDashboardOptions() {
+  if (meta.value.key !== 'drill_path') return
+  try {
+    const payload = await listEntries('dashboard_builder', {}, 1, 200)
+    dashboardOptions.value = payload.items.map((row) => ({
+      id: Number(row.id),
+      name: String(row['仪表盘名称'] ?? row.id),
+    }))
+    if (!selectedDashboardId.value && dashboardOptions.value.length) {
+      selectedDashboardId.value = dashboardOptions.value[0].id
+    }
+  } catch {
+    dashboardOptions.value = []
+  }
+}
+
 const statusSummary = computed(() =>
-  meta.statuses.map((status) => ({
+  meta.value.statuses.map((status) => ({
     status,
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
@@ -138,14 +211,14 @@ function resetFilters() {
 async function exportRows() {
   errorMessage.value = ''
   try {
-    await downloadEntries(meta.key, filters.value)
+    await downloadEntries(meta.value.key, filters.value)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '导出失败'
   }
 }
 
 function openCreate() {
-  createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
+  createValues.value = Object.fromEntries(meta.value.fields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
 }
@@ -154,7 +227,7 @@ async function submitCreate() {
   creating.value = true
   errorMessage.value = ''
   try {
-    const result = await createEntry(meta.key, createValues.value)
+    const result = await createEntry(meta.value.key, createValues.value)
     if (!result.ok) throw new Error(result.message)
     showCreate.value = false
     await reload()
@@ -168,7 +241,7 @@ async function submitCreate() {
 async function runAction(action: string, row: EntryRow) {
   errorMessage.value = ''
   try {
-    const result = await applyAction(meta.key, Number(row.id), action)
+    const result = await applyAction(meta.value.key, Number(row.id), action)
     if (!result.ok) throw new Error(result.message)
     await reload()
   } catch (error) {
@@ -179,7 +252,7 @@ async function runAction(action: string, row: EntryRow) {
 async function reload() {
   errorMessage.value = ''
   try {
-    const payload = await listEntries(meta.key, filters.value)
+    const payload = await listEntries(meta.value.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
   } catch (error) {
@@ -187,5 +260,21 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(async () => {
+  await reload()
+  await loadDashboardOptions()
+})
+
+// 同一组件在模块间路由切换时复用实例，需要重置选中状态并重新取数。
+watch(
+  () => props.moduleKey,
+  async () => {
+    filters.value = {}
+    selectedDashboardId.value = null
+    dashboardOptions.value = []
+    showCreate.value = false
+    await reload()
+    await loadDashboardOptions()
+  },
+)
 </script>

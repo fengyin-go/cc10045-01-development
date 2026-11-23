@@ -82,6 +82,70 @@ def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     return entry
 
 
+# ================================================================
+# 汇总凭据：图表数值的窗口 / 维度 / 计算版本 / 贡献事件数
+# ================================================================
+
+@router.get("/dashboard_builder/{dashboard_id}/credentials", response_model=dict)
+def dashboard_credentials(
+    dashboard_id: int,
+    version: int | None = Query(default=None, ge=1),
+    all_groups: bool = Query(default=False),
+) -> dict[str, Any]:
+    """仪表盘内全部图表的汇总凭据；带 version 时按该版本回查。"""
+    service = require_service("dashboard_builder")
+    return service.chart_credentials(dashboard_id, version=version, all_groups=all_groups)
+
+
+@router.get("/dashboard_builder/{dashboard_id}/charts/{chart_index}/credential", response_model=dict)
+def chart_credential(
+    dashboard_id: int,
+    chart_index: int,
+    version: int | None = Query(default=None, ge=1),
+    all_groups: bool = Query(default=False),
+) -> dict[str, Any]:
+    """单张图表的汇总凭据。"""
+    service = require_service("dashboard_builder")
+    return service.chart_credential(
+        dashboard_id, chart_index, version=version, all_groups=all_groups)
+
+
+@router.get("/dashboard_builder/{dashboard_id}/charts/{chart_index}/compare", response_model=dict)
+def compare_chart_regions(
+    dashboard_id: int,
+    chart_index: int,
+    left: str = Query(min_length=1),
+    right: str = Query(min_length=1),
+    region_dimension: str = Query(default="region"),
+    dimension_key: str = Query(default=""),
+) -> dict[str, Any]:
+    """并排比较同窗口下两个地区，锁定两边都齐全的同一版本。"""
+    service = require_service("dashboard_builder")
+    return service.compare_chart_regions(
+        dashboard_id, chart_index,
+        left_region=left, right_region=right,
+        region_dimension=region_dimension, dimension_key=dimension_key,
+    )
+
+
+@router.post("/drill_path/drill", response_model=dict)
+def drill_from_credential(payload: dict[str, Any]) -> dict[str, Any]:
+    """按汇总凭据的窗口 + 版本 + 维度分组下钻，返回贡献明细。"""
+    missing = [
+        key for key in ("window_id", "dimension_key", "computation_version")
+        if payload.get(key) in (None, "")
+    ]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"缺少参数：{'、'.join(missing)}")
+    service = require_service("drill_path")
+    return service.drill_from_credential(
+        window_id=int(payload["window_id"]),
+        dimension_key=str(payload["dimension_key"]),
+        computation_version=int(payload["computation_version"]),
+        limit=int(payload.get("limit", 500)),
+    )
+
+
 @router.post("/{module}", response_model=ActionResult)
 def create_entry(module: str, payload: EntryPayload) -> ActionResult:
     service = require_service(module)

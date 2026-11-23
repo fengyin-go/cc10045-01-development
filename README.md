@@ -46,8 +46,41 @@ npm run dev
 前端默认监听 `http://127.0.0.1:5199/`，dev server 不会自动打开浏览器，
 需要自己访问。`/api` 由 vite 代理到后端 `http://127.0.0.1:8019`。
 
-## 业务模块
+## 汇总凭据与版本化下钻
 
+`dashboard_builder` / `drill_path` 页面下方的「汇总凭据」面板回答「这个图表数字是怎么来的」：
+
+- 每条图表凭据列出聚合窗口、维度、计算版本、基准时刻和贡献事件数；
+  展开分组即按「窗口 + 版本 + 维度分组」回查贡献明细，明细条数须等于凭据里的条数。
+- 一次下钻只用一个「已完成」版本。用未完成/不存在的版本下钻会被拒绝。
+- 关键维度取不到值（缺键、空串、null）统一归到 `（缺失）` 组，并在
+  `missing_dimensions` 里标出；事件里真的填了 `"?"` 的是普通分组，两者不会混在一起。
+  地区过滤图可勾选「显示全部分组」查看这两组。
+- 同一窗口被多个地区图表引用时，某地区出新版、另一地区仍在重算：
+  各图可单独看自己最新的已完成版本；并排比较只锁定两边都齐全的同一版本，
+  未齐全时只给出两边各自最新版本、不强行比较。补齐后两图一起切到新版，
+  旧图仍可用 `?version=<n>` 回查取数依据。
+
+相关接口：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/dashboard_builder/{id}/credentials[?version=N&all_groups=true]` | 仪表盘全部图表凭据 |
+| GET | `/api/dashboard_builder/{id}/charts/{index}/credential[?version=N]` | 单图凭据 |
+| GET | `/api/dashboard_builder/{id}/charts/{index}/compare?left=..&right=..` | 并排比较（锁定共同版本） |
+| POST | `/api/drill_path/drill` | 凭据下钻，body: `window_id`、`dimension_key`、`computation_version` |
+| POST | `/api/pipeline/aggregation/{window}/run-region` | 单地区重算/补齐版本 |
+| GET | `/api/pipeline/aggregation/{window}/versions` | 各版本分组完成情况 |
+
+端到端验证（临时库，不影响本地数据）：
+
+```bash
+backend/.venv/bin/python -I verify/verify_credentials.py   # 服务层
+# 另开一个后端实例（CC10045_DB_DIR 指向临时目录）后：
+backend/.venv/bin/python -I verify/e2e_http.py http://127.0.0.1:8019 /path/to/cc10045.db
+```
+
+## 业务模块
 | 模块 | 目录 | 业务对象 | 主要字段 |
 | --- | --- | --- | --- |
 | 实时聚合器 | `realtime_agg` | 聚合窗口 | 窗口名称、数据源、聚合维度 |

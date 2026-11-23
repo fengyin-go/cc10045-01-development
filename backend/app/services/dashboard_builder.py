@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from app.database import db
+from app.services.aggregation_credentials import summarize_chart
 from app.services.base import BaseModuleService
 
 
@@ -22,6 +23,98 @@ class DashboardBuilderService(BaseModuleService):
     STATUS_ORDER = ["草稿", "已发布", "已归档"]
     ACTION_RULES = {"发布面板": "已发布", "归档面板": "已归档"}
     NEGATIVE_ACTIONS = []
+
+    # ================================================================
+    # 汇总凭据：图表数值的窗口 / 维度 / 版本 / 贡献事件数
+    # ================================================================
+
+    def _charts(self, dashboard: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = dashboard.get("chart_configs", "[]")
+        try:
+            charts = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            charts = []
+        return charts if isinstance(charts, list) else []
+
+    def chart_credentials(
+        self, dashboard_id: int, version: int | None = None, *, all_groups: bool = False,
+    ) -> dict[str, Any]:
+        """仪表盘内每张图表的汇总凭据。
+
+        version 为空时每张图取自己窗口的最新已完成版本；指定 version 时
+        所有图表都按该版本回查，用于「旧图回查取数依据」。
+        all_groups=True 时忽略地区过滤，展示该版本全部分组（含缺失组与问号组）。
+        """
+        dashboard = db.fetchone("SELECT * FROM dashboards WHERE id=?", [dashboard_id])
+        if dashboard is None:
+            return {"ok": False, "message": f"仪表盘 {dashboard_id} 不存在"}
+
+        charts = self._charts(dashboard)
+        credentials = []
+        for index, chart in enumerate(charts):
+            enriched = dict(chart)
+            enriched["dashboard_id"] = dashboard_id
+            credential = summarize_chart(enriched, version=version, all_groups=all_groups)
+            credential["chart_index"] = index
+            credentials.append(credential)
+
+        return {
+            "ok": True,
+            "dashboard_id": dashboard_id,
+            "dashboard_name": dashboard["dashboard_name"],
+            "requested_version": version,
+            "all_groups": all_groups,
+            "charts": credentials,
+        }
+
+    def chart_credential(
+        self, dashboard_id: int, chart_index: int, version: int | None = None,
+        *, all_groups: bool = False,
+    ) -> dict[str, Any]:
+        """单张图表的汇总凭据。"""
+        dashboard = db.fetchone("SELECT * FROM dashboards WHERE id=?", [dashboard_id])
+        if dashboard is None:
+            return {"ok": False, "message": f"仪表盘 {dashboard_id} 不存在"}
+        charts = self._charts(dashboard)
+        if chart_index < 0 or chart_index >= len(charts):
+            return {"ok": False, "message": f"仪表盘 {dashboard_id} 没有第 {chart_index} 张图表"}
+        chart = dict(charts[chart_index])
+        chart["dashboard_id"] = dashboard_id
+        credential = summarize_chart(chart, version=version, all_groups=all_groups)
+        credential["chart_index"] = chart_index
+        return credential
+
+    def compare_chart_regions(
+        self,
+        dashboard_id: int,
+        chart_index: int,
+        *,
+        left_region: str,
+        right_region: str,
+        region_dimension: str = "region",
+        dimension_key: str = "",
+    ) -> dict[str, Any]:
+        """并排比较同窗口下两个地区，锁定两边都齐全的同一版本。"""
+        dashboard = db.fetchone("SELECT * FROM dashboards WHERE id=?", [dashboard_id])
+        if dashboard is None:
+            return {"ok": False, "message": f"仪表盘 {dashboard_id} 不存在"}
+        charts = self._charts(dashboard)
+        if chart_index < 0 or chart_index >= len(charts):
+            return {"ok": False, "message": f"仪表盘 {dashboard_id} 没有第 {chart_index} 张图表"}
+
+        from app.services.aggregation_credentials import compare_regions, _chart_window
+
+        window = _chart_window(dict(charts[chart_index]))
+        if window is None:
+            return {"ok": False, "message": "图表未绑定有效聚合窗口"}
+
+        return compare_regions(
+            window_id=window["id"],
+            dimension_key=dimension_key,
+            left={"label": left_region, "region_value": left_region},
+            right={"label": right_region, "region_value": right_region},
+            region_dimension=region_dimension,
+        )
 
     def dashboard_data(self, dashboard_id: int) -> dict[str, Any]:
         """组装仪表盘的实时数据。"""

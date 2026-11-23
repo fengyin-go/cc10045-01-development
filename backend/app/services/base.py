@@ -15,6 +15,8 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+    # 建记录时补齐表里的非空列（不来自用户输入的配置项）。
+    EXTRA_DEFAULTS: dict[str, Any] = {}
 
     def _module_table(self) -> str:
         """返回模块主表名，子类可覆盖。"""
@@ -94,9 +96,15 @@ class BaseModuleService:
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
             data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
-            data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
+
+        # 只有表里确实有 name 列时才追加，避免给无该列的表插值。
+        columns = {row["name"] for row in db.fetchall(f"PRAGMA table_info({table})")}
+        if "name" not in columns:
+            data.pop("name", None)
+        for key, value in self.EXTRA_DEFAULTS.items():
+            data.setdefault(key, value)
+        data = {key: value for key, value in data.items() if key in columns}
 
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])

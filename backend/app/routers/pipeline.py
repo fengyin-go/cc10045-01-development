@@ -39,10 +39,58 @@ def api_run_all_aggregations() -> dict:
 
 
 @router.post("/aggregation/{window_id}/run")
-def api_run_aggregation(window_id: int) -> dict:
-    """对指定聚合窗口执行单次计算。"""
+def api_run_aggregation(window_id: int, payload: dict | None = None) -> dict:
+    """对指定聚合窗口执行单次计算；可传 as_of 固定窗口截止时刻。"""
     svc = service_for("realtime_agg")
-    return svc.run_aggregation(window_id)
+    payload = payload or {}
+    return svc.run_aggregation(window_id, as_of=payload.get("as_of"))
+
+
+@router.post("/aggregation/{window_id}/run-region")
+def api_run_region_version(window_id: int, payload: dict | None = None) -> dict:
+    """只重算某个地区并登记版本。
+
+    不传 version 时分配新版本，其余分组登记为「重算中」；
+    传 version 时把该地区补齐到指定版本。
+    """
+    from fastapi import HTTPException
+
+    payload = payload or {}
+    region_dimension = str(payload.get("region_dimension") or "region")
+    region_value = payload.get("region_value")
+    if not region_value:
+        raise HTTPException(status_code=422, detail="缺少参数：region_value")
+    svc = service_for("realtime_agg")
+    return svc.run_region_version(
+        window_id,
+        region_dimension=region_dimension,
+        region_value=str(region_value),
+        as_of=payload.get("as_of"),
+        version=int(payload["version"]) if payload.get("version") is not None else None,
+    )
+
+
+@router.get("/aggregation/{window_id}/versions")
+def api_aggregation_versions(window_id: int) -> dict:
+    """窗口各版本的分组完成情况。"""
+    from app.services.realtime_agg import version_summary
+    from app.services.aggregation_credentials import version_regions
+
+    regions = version_regions(window_id)
+    return {
+        "ok": True,
+        "window_id": window_id,
+        "versions": [
+            {
+                "version": version,
+                "status": bucket["status"],
+                "recalculating": bucket["recalculating"],
+                "groups": bucket["regions"],
+                "summary": version_summary(window_id, version),
+            }
+            for version, bucket in sorted(regions.items())
+        ],
+    }
 
 
 @router.post("/metrics/compute-all")

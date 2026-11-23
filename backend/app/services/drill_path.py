@@ -28,10 +28,10 @@ class DrillPathService(BaseModuleService):
         if rule is None:
             return {"ok": False, "message": f"下钻规则 {rule_id} 不存在"}
 
-        start_metric = rule.get("起始指标", rule.get("start_metric", ""))
-        drill_dim = rule.get("下钻维度", rule.get("drill_dimension", ""))
-        target = rule.get("跳转目标", rule.get("target_module", ""))
-        granularity = rule.get("默认粒度", rule.get("default_granularity", "day"))
+        start_metric = rule.get("start_metric", "")
+        drill_dim = rule.get("drill_dimension", "")
+        target = rule.get("target_module", "")
+        granularity = rule.get("default_granularity", "day")
 
         layers: list[dict[str, Any]] = []
 
@@ -58,9 +58,10 @@ class DrillPathService(BaseModuleService):
         )
         layers.append({
             "layer": 2,
-            "name": f"按{dill_dim}拆解",
+            "name": f"按{drill_dim}拆解",
             "data": [{"dim_key": r["dimension_key"], "value": r["computed_value"],
-                     "event_count": r["event_count"]} for r in agg_results],
+                     "event_count": r["event_count"],
+                     "computation_version": r["computation_version"]} for r in agg_results],
             "granularity": granularity,
         })
 
@@ -88,11 +89,57 @@ class DrillPathService(BaseModuleService):
 
         return {
             "ok": True,
-            "rule_name": rule.get("规则名称", rule.get("rule_name", "")),
+            "rule_name": rule.get("rule_name", ""),
             "start_metric": start_metric,
             "drill_dimension": drill_dim,
             "layers": layers,
         }
+
+    # ================================================================
+    # 凭据式下钻：窗口 + 版本 + 维度分组 → 贡献明细
+    # ================================================================
+
+    def drill_from_credential(
+        self,
+        *,
+        window_id: int,
+        dimension_key: str,
+        computation_version: int,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """按汇总凭据传来的窗口与版本回查贡献明细。
+
+        一次下钻只用一个已完成版本：先校验该版本在这条分组上已完成，
+        再按 result_id 读出登记过的贡献事件，条数与凭据一致。
+        """
+        from app.services.aggregation_credentials import drill_down
+
+        record = db.fetchone(
+            "SELECT status FROM aggregation_versions WHERE window_id=? "
+            "AND computation_version=? AND dimension_key=?",
+            [window_id, computation_version, dimension_key],
+        )
+        if record is None:
+            return {
+                "ok": False,
+                "message": f"窗口 {window_id} 版本 {computation_version} 没有分组 {dimension_key} 的完成记录",
+                "events": [],
+                "returned_count": 0,
+            }
+        if record["status"] != "已完成":
+            return {
+                "ok": False,
+                "message": f"版本 {computation_version} 的该分组当前为{record['status']}，不能用未完成版本下钻",
+                "events": [],
+                "returned_count": 0,
+            }
+
+        return drill_down(
+            window_id=window_id,
+            dimension_key=dimension_key,
+            computation_version=computation_version,
+            limit=limit,
+        )
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

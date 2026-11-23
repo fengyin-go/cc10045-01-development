@@ -81,20 +81,92 @@ def ingest_events(event_definitions: list[dict[str, Any]], batch_id: str | None 
     return total
 
 
+# 关键维度取不到值时，统一归到「缺失组」。
+# 维度值为空串 / None / 键缺失都算缺失；事件里真的填了 "?" 的仍然是普通取值，
+# 两者在 dimension_key 与 missing_dimensions 上都能区分开。
+MISSING_DIMENSION_VALUE = "（缺失）"
+MISSING_DIMENSION_TOKEN = "__MISSING__"
+
+
+def _dimension_slot(
+    attrs: dict[str, Any], dim: str,
+) -> tuple[str, bool]:
+    """返回 (维度取值, 是否缺失)。"""
+    if not isinstance(attrs, dict) or dim not in attrs:
+        return MISSING_DIMENSION_TOKEN, True
+    value = attrs.get(dim)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return MISSING_DIMENSION_TOKEN, True
+    return str(value), False
+
+
+def build_dimension_key(attrs: dict[str, Any], dims: list[str]) -> dict[str, Any]:
+    """根据事件属性和维度列表构造分组键。
+
+    - dimension_key: 展示用，缺失用「（缺失）」占位
+    - dimension_values: 每个维度的实际取值，缺失为 None
+    - missing_dimensions: 缺失维度名列表（空列表表示该组各维度都有值）
+    - group_token: 稳定且无歧义的机器键，用于下钻关联与版本登记
+    """
+    values: dict[str, Any] = {}
+    tokens: list[str] = []
+    missing: list[str] = []
+    for dim in dims:
+        value, is_missing = _dimension_slot(attrs, dim)
+        values[dim] = None if is_missing else value
+        tokens.append(f"{dim}={MISSING_DIMENSION_TOKEN}" if is_missing else f"{dim}={value}")
+        if is_missing:
+            missing.append(dim)
+    return {
+        "dimension_key": "|".join(
+            MISSING_DIMENSION_VALUE if values[d] is None else str(values[d]) for d in dims
+        ),
+        "dimension_values": values,
+        "missing_dimensions": missing,
+        "group_token": "|".join(tokens),
+    }
+
+
+def default_as_of() -> str:
+    """聚合的基准时刻：窗口截止时间（与 compute_aggregation 保持一致）。"""
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _window_bounds(as_of: str, window_size_seconds: int) -> tuple[str, str]:
+    end_dt = datetime.strptime(as_of, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    start_dt = end_dt - timedelta(seconds=int(window_size_seconds))
+    return (start_dt.strftime("%Y-%m-%dT%H:%M:%S"), end_dt.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
 # ============================================================================
 # 实时聚合管道：从事件表读取数据，按窗口维度执行聚合
 # ============================================================================
 
-def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
+def compute_aggregation(
+    window: dict[str, Any],
+    *,
+    as_of: str | None = None,
+    version: int | None = None,
+    scope: dict[str, str] | None = None,
+    target_groups: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """对指定聚合窗口执行计算。
 
     从 events 表读取匹配数据源，按维度分组，在时间窗口内执行聚合函数。
-    结果写入 aggregation_results 表，返回新增结果列表。
+    结果写入 aggregation_results 表，并把贡献事件写入 aggregation_result_events。
+
+    版本语义：
+    - version 为空时分配窗口内的下一个版本号（一次调用 = 一个完整新版本）；
+    - version 指定时写入该版本，用于「其它分组补齐同一版本」；
+    - scope 按维度取值过滤事件（例如只看 region=东北区），配合 version 实现
+      「一个地区先出新版、另一个地区仍在旧版本」的中间态；
+    - target_groups 非空时只写入列出的分组。
+    返回本次写入的结果列表。
     """
     window_id = window["id"]
-    data_source = window.get("数据源", "")
-    dimensions_raw = window.get("聚合维度", "[]")
-    agg_func = window.get("聚合函数", "COUNT")
+    data_source = window.get("数据源", window.get("data_source_module", ""))
+    dimensions_raw = window.get("聚合维度", window.get("dimensions", "[]"))
+    agg_func = window.get("聚合函数", window.get("agg_function", "COUNT"))
     window_type = window.get("window_type", "tumbling")
     window_size = window.get("窗口大小", window.get("window_size_seconds", 60))
 
@@ -102,14 +174,14 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
         dims = json.loads(dimensions_raw) if isinstance(dimensions_raw, str) else dimensions_raw
     except (json.JSONDecodeError, TypeError):
         dims = []
+    dims = [str(d) for d in dims]
 
-    now_dt = datetime.now(timezone.utc)
-    window_end = now_dt.replace(microsecond=0)
-    window_start = window_end - timedelta(seconds=int(window_size))
+    as_of = as_of or default_as_of()
+    window_start, window_end = _window_bounds(as_of, int(window_size))
 
     # 查询窗口内的事件
     events_query = "SELECT * FROM events WHERE occurred_at >= ? AND occurred_at < ?"
-    params = [window_start.strftime("%Y-%m-%dT%H:%M:%S"), window_end.strftime("%Y-%m-%dT%H:%M:%S")]
+    params = [window_start, window_end]
 
     if data_source and data_source != "all":
         events_query += " AND source_module = ?"
@@ -122,30 +194,48 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 
     # 按维度分组
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    group_meta: dict[str, dict[str, Any]] = {}
     for evt in events:
-        if dims:
+        attrs: dict[str, Any] = {}
+        try:
+            attrs = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
+        except (json.JSONDecodeError, TypeError):
             attrs = {}
-            try:
-                attrs = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
-            except (json.JSONDecodeError, TypeError):
-                pass
-            dim_key = "|".join(str(attrs.get(d, "?")) for d in dims)
+        if scope:
+            in_scope = True
+            for key, expected in scope.items():
+                actual = attrs.get(key)
+                if actual is None or str(actual) != str(expected):
+                    in_scope = False
+                    break
+            if not in_scope:
+                continue
+        if dims:
+            key_info = build_dimension_key(attrs, dims)
         else:
-            dim_key = "__all__"
+            key_info = {
+                "dimension_key": "__all__",
+                "dimension_values": {},
+                "missing_dimensions": [],
+                "group_token": "__all__",
+            }
+        token = key_info["group_token"]
+        group_meta[token] = key_info
+        groups[token].append(evt)
 
-        groups[dim_key].append(evt)
+    if not groups:
+        return []
 
-    # 执行聚合
     results = []
-    version = db.fetchone(
-        "SELECT COALESCE(MAX(computation_version), 0)+1 as v FROM aggregation_results WHERE window_id=?",
-        [window_id],
-    )
-    comp_version = int(version["v"]) if version else 1
+    comp_version = int(version) if version is not None else next_computation_version(window_id)
+
+    target_tokens = {g["group_token"] for g in target_groups} if target_groups is not None else None
 
     agg_func_upper = agg_func.upper().strip()
 
-    for dim_key, group_events in groups.items():
+    for token, group_events in groups.items():
+        if target_tokens is not None and token not in target_tokens:
+            continue
         if agg_func_upper == "COUNT":
             value = float(len(group_events))
         elif agg_func_upper in ("SUM", "总金额", "总量"):
@@ -180,24 +270,64 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             value = float(len(group_events))
 
+        meta = group_meta[token]
         record_id = db.insert("aggregation_results", {
             "window_id": window_id,
-            "window_start": window_start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "window_end": window_end.strftime("%Y-%m-%dT%H:%M:%S"),
-            "dimension_key": dim_key,
+            "window_start": window_start,
+            "window_end": window_end,
+            "dimension_key": token,
+            "dimension_values": json.dumps(meta["dimension_values"], ensure_ascii=False),
+            "missing_dimensions": json.dumps(meta["missing_dimensions"], ensure_ascii=False),
             "computed_value": round(value, 4),
             "event_count": len(group_events),
             "computation_version": comp_version,
         })
+        db.executemany(
+            "INSERT OR IGNORE INTO aggregation_result_events(result_id,event_id) VALUES(?,?)",
+            [(record_id, evt["id"]) for evt in group_events],
+        )
+        db.execute(
+            "INSERT INTO aggregation_versions"
+            "(window_id,computation_version,dimension_key,status,result_id,event_count,"
+            " window_start,window_end,as_of,started_at,completed_at) "
+            "VALUES(?,?,?,'已完成',?,?,?,?,?,?,?) "
+            "ON CONFLICT(window_id,computation_version,dimension_key) DO UPDATE SET "
+            "status='已完成',result_id=excluded.result_id,event_count=excluded.event_count,"
+            "window_start=excluded.window_start,window_end=excluded.window_end,"
+            "as_of=excluded.as_of,completed_at=excluded.completed_at",
+            [window_id, comp_version, token, record_id, len(group_events),
+             window_start, window_end, as_of, db.now(), db.now()],
+        )
         results.append({
             "id": record_id,
             "window_id": window_id,
-            "dimension_key": dim_key,
+            "computation_version": comp_version,
+            "dimension_key": token,
+            "display_key": meta["dimension_key"],
+            "dimension_values": meta["dimension_values"],
+            "missing_dimensions": meta["missing_dimensions"],
             "computed_value": round(value, 4),
             "event_count": len(group_events),
         })
 
     return results
+
+
+def next_computation_version(window_id: int) -> int:
+    """窗口内下一个计算版本号。
+
+    只取已登记的版本（aggregation_versions）而不是结果表里的最大值，
+    避免「版本已开始但还没有结果」被跳过。
+    """
+    row = db.fetchone(
+        "SELECT COALESCE(MAX(computation_version), 0) as v FROM ("
+        "  SELECT computation_version FROM aggregation_versions WHERE window_id=?"
+        "  UNION ALL"
+        "  SELECT computation_version FROM aggregation_results WHERE window_id=?"
+        ")",
+        [window_id, window_id],
+    )
+    return int(row["v"]) + 1 if row else 1
 
 
 # ============================================================================
@@ -1270,5 +1400,31 @@ def seed_real_data() -> dict[str, int]:
             "status": "已生效",
         })
     counts["alerts"] = len(alerts)
+
+    # 区域对比看板：同一聚合窗口被东北区 / 西南区两张图表引用，
+    # 用于演示「汇总凭据 + 版本化下钻 + 缺失组」。
+    region_window_id = db.insert("aggregation_windows", {
+        "window_name": "区域订单日窗口",
+        "data_source_module": "all",
+        "dimensions": json.dumps(["region"]),
+        "agg_function": "COUNT",
+        "window_type": "tumbling",
+        "window_size_seconds": 86400,
+        "status": "已启用",
+    })
+    db.insert("dashboards", {
+        "dashboard_name": "区域订单对比看板",
+        "chart_configs": json.dumps([
+            {"type": "bar", "title": "东北区订单",
+             "window": {"window_id": region_window_id, "region_dimension": "region", "region_value": "东北区"}},
+            {"type": "bar", "title": "西南区订单",
+             "window": {"window_id": region_window_id, "region_dimension": "region", "region_value": "西南区"}},
+        ], ensure_ascii=False),
+        "refresh_interval_seconds": 30,
+        "data_scope": "region",
+        "share_status": "team",
+        "status": "已发布",
+    })
+    counts["dashboards"] = 1
 
     return counts
